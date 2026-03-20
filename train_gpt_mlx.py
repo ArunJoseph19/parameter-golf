@@ -764,39 +764,66 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    #
+    # Uses a sliding window with stride 64. Each window is train_seq_len tokens long;
+    # only the last 64 tokens of each window are scored so each token is counted once.
+    # Because compiled_loss returns a mean over all seq_len positions, the last-64-token
+    # sum is recovered via: loss_full*seq_len - loss_prefix*(seq_len-64). This is exact
+    # since causal attention makes per-position losses identical across both calls for
+    # the shared prefix positions.
+    stride = 64
+    seq_len = args.train_seq_len
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-    if val_batch_tokens < args.train_seq_len:
+    if val_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
             f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
-    val_batch_seqs = val_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+    val_batch_wins = val_batch_tokens // seq_len
+    # Each window needs seq_len+1 consecutive tokens; windows start at 0, stride, 2*stride, ...
+    total_available = val_tokens.size - 1  # number of (input, target) pairs
+    total_wins = max((total_available - seq_len) // stride + 1, 0)
+    total_batches = max((total_wins + val_batch_wins - 1) // val_batch_wins, 1)
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
-        batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
-        chunk = val_tokens[raw_start:raw_end]
-        x_np = chunk[:-1].reshape(-1, args.train_seq_len)
-        y_np = chunk[1:].reshape(-1, args.train_seq_len)
+    for batch_idx, batch_win_start in enumerate(range(0, total_wins, val_batch_wins), start=1):
+        batch_win_end = min(batch_win_start + val_batch_wins, total_wins)
+        batch_wins = batch_win_end - batch_win_start
+        # Build full windows: shape (batch_wins, seq_len)
+        x_np = np.stack([
+            val_tokens[(batch_win_start + i) * stride : (batch_win_start + i) * stride + seq_len]
+            for i in range(batch_wins)
+        ])
+        y_np = np.stack([
+            val_tokens[(batch_win_start + i) * stride + 1 : (batch_win_start + i) * stride + seq_len + 1]
+            for i in range(batch_wins)
+        ])
+        # Build prefix windows (first seq_len-stride tokens) for loss subtraction
+        x_prefix_np = x_np[:, :seq_len - stride]
+        y_prefix_np = y_np[:, :seq_len - stride]
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
-        chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
-        prev_ids = x_np.reshape(-1)
-        tgt_ids = y_np.reshape(-1)
+        x_prefix = mx.array(x_prefix_np, dtype=mx.int32)
+        y_prefix = mx.array(y_prefix_np, dtype=mx.int32)
+        full_loss = compiled_loss(x, y).astype(mx.float32)
+        prefix_loss = compiled_loss(x_prefix, y_prefix).astype(mx.float32)
+        mx.eval(full_loss, prefix_loss)
+        # Sum of losses over only the last stride tokens per window across the batch
+        last_stride_loss_sum = (
+            float(full_loss.item()) * float(batch_wins * seq_len)
+            - float(prefix_loss.item()) * float(batch_wins * (seq_len - stride))
+        )
+        # Byte metrics for only the last stride targets per window
+        tgt_ids = y_np[:, -stride:].reshape(-1)
+        prev_ids = x_np[:, -stride:].reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
         bytes_np += (
             has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
         ).astype(np.int16, copy=False)
-        total_tokens += chunk_token_count
+        total_loss_sum += last_stride_loss_sum
+        total_tokens += float(batch_wins * stride)
         total_bytes += float(bytes_np.astype(np.float64).sum())
         if log_fn is not None and total_batches > 1 and (
             batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
