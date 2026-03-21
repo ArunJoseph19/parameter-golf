@@ -353,14 +353,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -530,11 +530,34 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class _FakeQuantizeInt6(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, w: Tensor) -> Tensor:
+        w32 = w.float()
+        if w32.ndim >= 2:
+            scale = w32.abs().max(dim=1).values / 31.0
+            scale = scale.clamp_min(1.0 / 31.0).view(-1, *([1] * (w32.ndim - 1)))
+        else:
+            scale = w32.abs().max() / 31.0
+            scale = scale.clamp_min(1.0 / 31.0)
+        return torch.clamp(torch.round(w32 / scale), -31.0, 31.0).mul_(scale).to(w.dtype)
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> Tensor:
+        return grad  # STE: pass gradients through unchanged
+
+
+def fake_quantize_int6(w: Tensor) -> Tensor:
+    return _FakeQuantizeInt6.apply(w)
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # During training, fake-quantize to int6 range via STE to prepare for int6 serialisation.
     def forward(self, x: Tensor) -> Tensor:
+        w = fake_quantize_int6(self.weight) if self.training else self.weight
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
