@@ -231,37 +231,61 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    #
+    # Uses a sliding window with stride 64. Each window is train_seq_len tokens long;
+    # only the last 64 tokens of each window are scored so each token is counted once.
+    # model(x, y) returns a mean over all seq_len positions, so the last-64-token sum is
+    # recovered via: loss_full*seq_len - loss_prefix*(seq_len-64). This is exact since
+    # causal attention makes per-position losses identical across both calls for the shared
+    # prefix positions.
+    stride = 64
+    seq_len = args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    local_batch_wins = local_batch_tokens // seq_len
+    total_available = val_tokens.numel() - 1  # number of (input, target) pairs
+    total_wins = max((total_available - seq_len) // stride + 1, 0)
+    win_start = (total_wins * rank) // world_size
+    win_end = (total_wins * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for batch_win_start in range(win_start, win_end, local_batch_wins):
+            batch_win_end = min(batch_win_start + local_batch_wins, win_end)
+            batch_wins = batch_win_end - batch_win_start
+            # Build full windows: shape (batch_wins, seq_len)
+            x = torch.stack([
+                val_tokens[i * stride : i * stride + seq_len]
+                for i in range(batch_win_start, batch_win_end)
+            ]).to(device=device, dtype=torch.int64, non_blocking=True)
+            y = torch.stack([
+                val_tokens[i * stride + 1 : i * stride + seq_len + 1]
+                for i in range(batch_win_start, batch_win_end)
+            ]).to(device=device, dtype=torch.int64, non_blocking=True)
+            # Prefix windows (first seq_len-stride tokens) for loss subtraction
+            x_prefix = x[:, :seq_len - stride]
+            y_prefix = y[:, :seq_len - stride]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
+                full_loss = model(x, y).detach()
+                prefix_loss = model(x_prefix, y_prefix).detach()
+            # Sum of losses over only the last stride tokens per window across the batch
+            last_stride_loss_sum = (
+                full_loss.to(torch.float64) * float(batch_wins * seq_len)
+                - prefix_loss.to(torch.float64) * float(batch_wins * (seq_len - stride))
+            )
+            val_loss_sum += last_stride_loss_sum
+            val_token_count += float(batch_wins * stride)
+            # Byte metrics for only the last stride targets per window
+            tgt_ids = y[:, -stride:].reshape(-1)
+            prev_ids = x[:, -stride:].reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
